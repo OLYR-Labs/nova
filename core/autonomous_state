@@ -1,0 +1,36 @@
+from enum import Enum
+
+
+class AutonomousState(str, Enum):
+    IDLE = "IDLE"
+    OBSERVE = "OBSERVE"
+    PLAN = "PLAN"
+    PERMISSION = "PERMISSION"
+    EXECUTE = "EXECUTE"
+    VERIFY = "VERIFY"
+    LEARN = "LEARN"
+    REPORT = "REPORT"
+    ERROR = "ERROR"
+
+
+class AutonomousStateController:
+
+    def __init__(self):
+        self.state = AutonomousState.IDLE
+
+    def set(self, state):
+        if isinstance(state, AutonomousState):
+            self.state = state
+        else:
+            self.state = AutonomousState(
+                str(state)
+            )
+
+    def get(self) -> str:
+        return self.state.value
+
+    def is_idle(self) -> bool:
+        return self.state == AutonomousState.IDLE
+
+    def is_busy(self) -> bool:
+        return self.state != AutonomousState.IDLE
