@@ -15,12 +15,11 @@ from core.thought_engine import ThoughtEngine
 class SelfDevelopmentEngine:
     """Bounded autonomous software-development loop for NOVA.
 
-    Loop:
-        observe -> plan -> modify -> verify -> diagnose -> repair -> reflect
+    observe -> plan -> modify -> verify -> diagnose -> repair -> reflect
 
-    The model never receives unrestricted shell access. It proposes file
-    changes; this controller validates paths, snapshots changes, applies them,
-    runs bounded verification commands, and restores the snapshot on failure.
+    The model proposes file changes. The controller validates paths, keeps a
+    run-level rollback snapshot, applies changes, runs bounded verification,
+    and restores the pre-run state when all repair attempts fail.
     """
 
     DEFAULT_MODEL = "qwen3-coder:30b"
@@ -33,6 +32,14 @@ class SelfDevelopmentEngine:
         ".env.production",
         "credentials.json",
         "secrets.json",
+    }
+
+    BLOCKED_PARTS = {
+        ".git",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".nova_backups",
     }
 
     def __init__(self, root: str, model: str | None = None):
@@ -50,17 +57,18 @@ class SelfDevelopmentEngine:
     def _allowed(self, path: str) -> bool:
         candidate = Path(path)
         name = candidate.name.lower()
-        return name not in {item.lower() for item in self.BLOCKED_FILES}
+        if name in {item.lower() for item in self.BLOCKED_FILES}:
+            return False
+        return not any(part.lower() in self.BLOCKED_PARTS for part in candidate.parts)
 
     def _tree(self, limit: int = 250) -> list[str]:
         results = []
-        blocked_dirs = {".git", ".venv", "venv", "__pycache__", ".nova_backups"}
         for item in sorted(self.root.rglob("*"), key=lambda p: str(p).lower()):
             try:
                 relative = item.relative_to(self.root)
             except ValueError:
                 continue
-            if any(part in blocked_dirs for part in relative.parts):
+            if any(part.lower() in self.BLOCKED_PARTS for part in relative.parts):
                 continue
             if item.is_file() and self._allowed(str(relative)):
                 results.append(str(relative))
@@ -93,9 +101,10 @@ class SelfDevelopmentEngine:
             think=True,
             options={"temperature": 0.1},
         )
-        content = (getattr(response, "response", "") or "").strip()
-        thinking = (getattr(response, "thinking", "") or "").strip()
-        return {"content": content, "thinking": thinking}
+        return {
+            "content": (getattr(response, "response", "") or "").strip(),
+            "thinking": (getattr(response, "thinking", "") or "").strip(),
+        }
 
     @staticmethod
     def _json(text: str) -> dict:
@@ -178,21 +187,26 @@ Rules:
     # ------------------------------------------------------------------
 
     def _snapshot(self, paths: list[str]) -> Path:
-        snapshot = self.root / ".nova" / "snapshots" / f"attempt_{self.thoughts.state.attempt}"
-        snapshot.mkdir(parents=True, exist_ok=True)
+        if self.snapshot_root is None:
+            self.snapshot_root = self.root / ".nova" / "snapshots" / "current_run"
+            if self.snapshot_root.exists():
+                shutil.rmtree(self.snapshot_root)
+            self.snapshot_root.mkdir(parents=True, exist_ok=True)
+
         for raw_path in paths:
             path = self.workspace.safe_path(raw_path)
             if path.exists() and path.is_file():
-                destination = snapshot / path.relative_to(self.root)
+                destination = self.snapshot_root / path.relative_to(self.root)
+                if destination.exists():
+                    continue
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, destination)
-        self.snapshot_root = snapshot
-        return snapshot
+        return self.snapshot_root
 
     def _rollback(self, changed_paths: list[str]):
         if self.snapshot_root is None:
             return
-        for raw_path in changed_paths:
+        for raw_path in set(changed_paths):
             target = self.workspace.safe_path(raw_path)
             saved = self.snapshot_root / target.relative_to(self.root)
             if saved.exists():
@@ -227,7 +241,10 @@ Rules:
     def _run_command(self, command: str) -> dict:
         if not command or len(command) > 500:
             return {"success": False, "error": "Invalid verification command."}
-        forbidden = ["&&", "||", ">", "<", "|", "git push", "git reset --hard", "del /", "rm -rf"]
+        forbidden = [
+            "&&", "||", ">", "<", "|", "git push", "git reset --hard",
+            "git checkout", "git clean", "del /", "rm -rf"
+        ]
         if any(token in command.lower() for token in forbidden):
             return {"success": False, "error": "Verification command contains a blocked shell construct."}
         try:
@@ -271,13 +288,15 @@ Rules:
             return {"success": False, "error": "Goal cannot be empty."}
 
         attempts = max(1, min(int(max_attempts or self.MAX_ATTEMPTS), self.MAX_ATTEMPTS))
+        self.snapshot_root = None
         self.thoughts.reset(goal)
         tree = self._tree()
         self.thoughts.observe(f"Discovered {len(tree)} project files.")
         self.thoughts.transition("PLAN", next_action="inspect relevant source files")
 
         try:
-            plan = self._json(self._model(self._planning_prompt(goal, tree))["content"])
+            plan_response = self._model(self._planning_prompt(goal, tree))
+            plan = self._json(plan_response["content"])
             self.last_plan = plan
             self.thoughts.decide(plan.get("summary", "Initial implementation plan"), 0.75)
             files = self._read_files(plan.get("files_to_read", []))
@@ -294,21 +313,33 @@ Rules:
             self.thoughts.begin_attempt(attempt)
             self.thoughts.transition("CODE", next_action="generate and apply a minimal patch")
             try:
-                coding = self._json(self._model(self._coding_prompt(goal, plan, files, failure))["content"])
+                coding = self._json(
+                    self._model(self._coding_prompt(goal, plan, files, failure))["content"]
+                )
                 changes = coding.get("changes", [])
                 if not isinstance(changes, list) or not changes:
                     raise ValueError("Coder returned no changes.")
 
                 paths = [str(item.get("path", "")) for item in changes]
                 self._snapshot(paths)
-                self.thoughts.observe(f"Attempt {attempt}: snapshot created for {len(paths)} files.")
-                changed_paths = self._apply(changes)
+                self.thoughts.observe(f"Attempt {attempt}: rollback snapshot updated for {len(paths)} files.")
+                applied = self._apply(changes)
+                for path in applied:
+                    if path not in changed_paths:
+                        changed_paths.append(path)
 
                 self.thoughts.transition("VERIFY", next_action="run verification")
-                verification = self._verify(coding.get("tests") or plan.get("verification") or ["python -m compileall -q ."])
+                verification = self._verify(
+                    coding.get("tests")
+                    or plan.get("verification")
+                    or ["python -m compileall -q ."]
+                )
                 if verification["success"]:
                     self.thoughts.transition("REFLECT", next_action="record the successful lesson")
-                    self.thoughts.learn(f"Goal succeeded on attempt {attempt}: {coding.get('summary', 'code change applied')}")
+                    self.thoughts.learn(
+                        f"Goal succeeded on attempt {attempt}: "
+                        f"{coding.get('summary', 'code change applied')}"
+                    )
                     self.thoughts.transition("DONE")
                     return {
                         "success": True,
@@ -321,10 +352,11 @@ Rules:
 
                 failure = verification.get("failure") or verification
                 self.thoughts.record_failure(failure)
-                self.thoughts.hypothesize("The implementation failed verification; diagnose the concrete test output and repair only the affected code.")
+                self.thoughts.hypothesize(
+                    "The implementation failed verification; diagnose the concrete "
+                    "test output and repair only the affected code."
+                )
                 self.thoughts.transition("DIAGNOSE", next_action="feed actual failure into repair pass")
-                # Keep the failed changes in place so the next coder can inspect
-                # the exact broken state. Roll back only after the final attempt.
                 files = self._read_files(paths)
             except Exception as error:
                 failure = {"error": str(error), "attempt": attempt}
@@ -333,9 +365,11 @@ Rules:
                 if changed_paths:
                     files = self._read_files(changed_paths)
 
-        self.thoughts.transition("ROLLBACK", next_action="restore last known good snapshot")
+        self.thoughts.transition("ROLLBACK", next_action="restore pre-run snapshot")
         self._rollback(changed_paths)
-        self.thoughts.learn("Autonomous change was rolled back because bounded verification did not pass.")
+        self.thoughts.learn(
+            "Autonomous change was rolled back because bounded verification did not pass."
+        )
         self.thoughts.transition("FAILED")
         return {
             "success": False,
